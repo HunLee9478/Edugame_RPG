@@ -113,6 +113,17 @@ if DOCX_AVAILABLE:
     from docx.shared import Inches as DocxInches, Pt as DocxPt, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+# SpellChecker 및 OCRManager import
+try:
+    from spell_checker import SpellChecker
+    from ocr_manager import OCRManager
+    SPELL_CHECKER_AVAILABLE = True
+    OCR_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: SpellChecker/OCRManager를 import할 수 없습니다: {e}")
+    SPELL_CHECKER_AVAILABLE = False
+    OCR_AVAILABLE = False
+
 
 # ============================================================================
 # 열거형 및 데이터 클래스
@@ -146,12 +157,13 @@ class ProcessingConfig:
     extract_audio: bool = True
     create_srt: bool = True
     create_word: bool = True
+    ocr_spell_check: bool = False  # OCR 맞춤법 검수 (기본 비활성화 - 시간 소요)
     grid_rows: int = 3
     grid_cols: int = 3
     whisper_model: str = "base"
     frame_sampling_interval: float = 1.0  # 새로운 설정: 샘플링 간격 (초)
     min_frame_interval: float = 0.5  # 최소 프레임 간격
-    max_frames_per_video: int = 99999  # 비디오당 최대 프레임 수 (사실상 무제한)
+    max_frames_per_video: int = 200  # 비디오당 최대 프레임 수
 
 
 @dataclass
@@ -873,6 +885,18 @@ class VideoProcessorGUI:
         self.error_manager = ErrorManager()
         self.path_manager = PathManager()
 
+        # OCRManager 초기화
+        if OCR_AVAILABLE:
+            try:
+                from ocr_manager import OCRManager
+                self.ocr_manager = OCRManager(use_ai_model=False)
+                self.error_manager.log(LogLevel.INFO, "OCRManager 초기화 완료")
+            except Exception as e:
+                self.ocr_manager = None
+                self.error_manager.log(LogLevel.WARNING, f"OCRManager 초기화 실패: {e}")
+        else:
+            self.ocr_manager = None
+
         self.video_files = []
         self.processing = False
         self.processing_thread = None
@@ -1004,12 +1028,17 @@ class VideoProcessorGUI:
         ttk.Checkbutton(output_options, text="Word 보고서",
                         variable=self.create_word_var).grid(row=4, column=0, columnspan=3, sticky=tk.W, padx=(20, 0))
 
+        # OCR 오탈자 검수 (선택적 - 시간 소요)
+        self.ocr_spell_check_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(output_options, text="OCR 오탈자 검수 (느림)",
+                        variable=self.ocr_spell_check_var).grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=(20, 0))
+
         # Whisper 모델 선택
-        ttk.Label(output_options, text="Whisper 모델:").grid(row=5, column=0, sticky=tk.W, padx=(20, 0))
+        ttk.Label(output_options, text="Whisper 모델:").grid(row=6, column=0, sticky=tk.W, padx=(20, 0))
         self.whisper_model_var = tk.StringVar(value="base")
         ttk.Combobox(output_options, textvariable=self.whisper_model_var,
                      values=["tiny", "base", "small", "medium", "large"],
-                     state="readonly", width=10).grid(row=5, column=1, padx=5)
+                     state="readonly", width=10).grid(row=6, column=1, padx=5)
 
         options_frame.columnconfigure(0, weight=1)
         options_frame.columnconfigure(1, weight=1)
@@ -1043,8 +1072,8 @@ class VideoProcessorGUI:
 
         # 최대 프레임 수 설정
         ttk.Label(sampling_frame, text="최대 프레임 수:").grid(row=2, column=0, sticky=tk.W)
-        self.max_frames_var = tk.IntVar(value=99999)
-        ttk.Spinbox(sampling_frame, from_=10, to=99999, width=10,
+        self.max_frames_var = tk.IntVar(value=200)
+        ttk.Spinbox(sampling_frame, from_=10, to=1000, width=10,
                     textvariable=self.max_frames_var).grid(row=2, column=1, padx=5, sticky=tk.W)
 
         # 미리보기 정보
@@ -1121,14 +1150,22 @@ class VideoProcessorGUI:
         ttk.Button(button_frame, text="🔄 설정 불러오기",
                    command=self.load_config).grid(row=0, column=3, padx=5)
 
+        # OCR 검수만 실행 버튼
+        ttk.Button(button_frame, text="🔍 OCR 검수만",
+                   command=self.run_ocr_only).grid(row=0, column=4, padx=5)
+
+        # 통합 맞춤법 검사 버튼 (새로 추가)
+        ttk.Button(button_frame, text="📝 맞춤법 검사",
+                   command=self.run_integrated_spell_check).grid(row=0, column=5, padx=5)
+
         ttk.Button(button_frame, text="🗑️ 로그 지우기",
-                   command=self.clear_log).grid(row=0, column=4, padx=5)
+                   command=self.clear_log).grid(row=0, column=6, padx=5)
 
         ttk.Button(button_frame, text="📊 상태 확인",
-                   command=self.show_status).grid(row=0, column=5, padx=5)
+                   command=self.show_status).grid(row=0, column=7, padx=5)
 
         ttk.Button(button_frame, text="❌ 종료",
-                   command=self.on_closing).grid(row=0, column=6, padx=5)
+                   command=self.on_closing).grid(row=1, column=0, columnspan=8, padx=5, pady=(5,0))
 
     def _update_threshold_label(self, value):
         """유사도 임계값 라벨 업데이트"""
@@ -1279,6 +1316,7 @@ class VideoProcessorGUI:
                 extract_audio=self.extract_audio_var.get(),
                 create_srt=self.create_srt_var.get(),
                 create_word=self.create_word_var.get(),
+                ocr_spell_check=self.ocr_spell_check_var.get(),
                 grid_rows=self.grid_rows_var.get(),
                 grid_cols=self.grid_cols_var.get(),
                 whisper_model=self.whisper_model_var.get(),
@@ -1315,6 +1353,7 @@ class VideoProcessorGUI:
             self.extract_audio_var.set(config.extract_audio)
             self.create_srt_var.set(config.create_srt)
             self.create_word_var.set(config.create_word)
+            self.ocr_spell_check_var.set(config.ocr_spell_check)
             self.grid_rows_var.set(config.grid_rows)
             self.grid_cols_var.set(config.grid_cols)
             self.whisper_model_var.set(config.whisper_model)
@@ -1486,6 +1525,7 @@ class VideoProcessorGUI:
                 extract_audio=self.extract_audio_var.get(),
                 create_srt=self.create_srt_var.get(),
                 create_word=self.create_word_var.get(),
+                ocr_spell_check=self.ocr_spell_check_var.get(),
                 grid_rows=self.grid_rows_var.get(),
                 grid_cols=self.grid_cols_var.get(),
                 whisper_model=self.whisper_model_var.get(),
@@ -1516,6 +1556,206 @@ class VideoProcessorGUI:
             self.error_manager.log(LogLevel.INFO, "사용자가 처리 중지를 요청했습니다.")
         except Exception as e:
             self.error_manager.log(LogLevel.ERROR, "처리 중지 실패", e)
+
+    def run_ocr_only(self):
+        """저장된 이미지에 대해 OCR 검수만 실행"""
+        try:
+            from tkinter import filedialog, messagebox
+
+            # 입력 폴더 선택
+            input_folder = filedialog.askdirectory(title="OCR 검수할 이미지 폴더 선택")
+            if not input_folder:
+                return
+
+            input_path = Path(input_folder)
+            if not input_path.exists():
+                messagebox.showerror("오류", f"폴더가 존재하지 않습니다:\n{input_folder}")
+                return
+
+            # 출력 폴더 자동 설정
+            output_path = input_path.parent / f"{input_path.name}_ocr_checked"
+
+            # 확인 다이얼로그
+            msg = f"OCR 검수를 시작하시겠습니까?\n\n"
+            msg += f"입력 폴더: {input_path}\n"
+            msg += f"출력 폴더: {output_path}\n\n"
+            msg += f"비교 모드: 빨간색(오류) vs 초록색(교정)"
+
+            if not messagebox.askyesno("OCR 검수 확인", msg):
+                return
+
+            # OCR Manager 확인
+            if not self.ocr_manager or not OCR_AVAILABLE:
+                messagebox.showerror("오류", "OCR Manager를 사용할 수 없습니다.\nocr_manager.py를 확인하세요.")
+                return
+
+            # 로그 시작
+            self.error_manager.log(LogLevel.INFO, "=" * 60)
+            self.error_manager.log(LogLevel.INFO, "OCR 검수만 실행")
+            self.error_manager.log(LogLevel.INFO, f"입력: {input_path}")
+            self.error_manager.log(LogLevel.INFO, f"출력: {output_path}")
+            self.error_manager.log(LogLevel.INFO, "=" * 60)
+
+            # 진행 콜백
+            def progress_callback(current, total, path):
+                progress = (current / total) * 100
+                self._safe_gui_update(lambda: self.progress_var.set(progress))
+                self._safe_gui_update(lambda: self.status_label.configure(
+                    text=f"OCR 검수 중: {current}/{total}"))
+                self.error_manager.log(LogLevel.INFO,
+                    f"[{current}/{total}] {Path(path).name}")
+
+            # OCR 처리 시작
+            self._safe_gui_update(lambda: self.process_button.configure(state="disabled"))
+
+            result = self.ocr_manager.process_folder(
+                input_path,
+                output_dir=output_path,
+                comparison_mode=True,
+                file_pattern="*.jpg",  # 필요시 "*.png"로 변경
+                callback=progress_callback
+            )
+
+            # 결과 표시
+            self.error_manager.log(LogLevel.INFO, "=" * 60)
+            if result['success']:
+                self.error_manager.log(LogLevel.INFO,
+                    f"✅ OCR 검수 완료: {result['processed']}/{result['total']}개")
+                self.error_manager.log(LogLevel.INFO, f"출력 폴더: {output_path}")
+
+                messagebox.showinfo("완료",
+                    f"OCR 검수가 완료되었습니다!\n\n"
+                    f"처리: {result['processed']}/{result['total']}개\n"
+                    f"실패: {result['failed']}개\n\n"
+                    f"출력: {output_path}")
+            else:
+                self.error_manager.log(LogLevel.ERROR, "❌ OCR 검수 실패")
+                messagebox.showerror("실패", "OCR 검수 중 오류가 발생했습니다.")
+
+        except Exception as e:
+            self.error_manager.log(LogLevel.ERROR, "OCR 검수 중 오류 발생", e)
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("오류", f"OCR 검수 중 오류:\n{e}")
+
+        finally:
+            self._safe_gui_update(lambda: self.process_button.configure(state="normal"))
+            self._safe_gui_update(lambda: self.progress_var.set(0))
+            self._safe_gui_update(lambda: self.status_label.configure(text="대기 중"))
+
+    def run_integrated_spell_check(self):
+        """통합 맞춤법 검사 실행 (문서 → 사전 생성 → 맞춤법 검사 → 리포트)"""
+        try:
+            from tkinter import filedialog, messagebox
+
+            # 입력 폴더 선택
+            input_folder = filedialog.askdirectory(title="맞춤법 검사할 문서 폴더 선택 (Word/PPT)")
+            if not input_folder:
+                return
+
+            input_path = Path(input_folder)
+            if not input_path.exists():
+                messagebox.showerror("오류", f"폴더가 존재하지 않습니다:\n{input_folder}")
+                return
+
+            # 출력 폴더 자동 설정
+            output_path = input_path.parent / f"{input_path.name}_spell_checked"
+
+            # 확인 다이얼로그
+            msg = f"통합 맞춤법 검사를 시작하시겠습니까?\n\n"
+            msg += f"입력 폴더: {input_path}\n"
+            msg += f"출력 폴더: {output_path}\n\n"
+            msg += f"기능:\n"
+            msg += f"  1. Word/PPT 문서 텍스트 추출\n"
+            msg += f"  2. 자주 사용되는 단어 사전 생성\n"
+            msg += f"  3. 사전 단어를 화이트리스트로 반영\n"
+            msg += f"  4. 실제 오탈자만 검출\n"
+            msg += f"  5. 엑셀 리포트 생성"
+
+            if not messagebox.askyesno("통합 맞춤법 검사 확인", msg):
+                return
+
+            # 통합 솔루션 import
+            try:
+                from integrated_spell_solution import IntegratedSpellSolution
+            except ImportError:
+                messagebox.showerror("오류", "integrated_spell_solution.py를 찾을 수 없습니다.")
+                return
+
+            # 로그 시작
+            self.error_manager.log(LogLevel.INFO, "=" * 60)
+            self.error_manager.log(LogLevel.INFO, "통합 맞춤법 검사 실행")
+            self.error_manager.log(LogLevel.INFO, f"입력: {input_path}")
+            self.error_manager.log(LogLevel.INFO, f"출력: {output_path}")
+            self.error_manager.log(LogLevel.INFO, "=" * 60)
+
+            # 진행 콜백
+            def progress_callback(stage_name, current, total):
+                progress = (current / total) * 100
+                self._safe_gui_update(lambda: self.progress_var.set(progress))
+                self._safe_gui_update(lambda: self.status_label.configure(
+                    text=f"[{stage_name}] 진행 중..."))
+                self.error_manager.log(LogLevel.INFO, f"[{stage_name}] 진행 중...")
+
+            # 처리 시작
+            self._safe_gui_update(lambda: self.process_button.configure(state="disabled"))
+
+            # 통합 솔루션 실행
+            solution = IntegratedSpellSolution(
+                use_morpheme=True,       # 형태소 분석 사용
+                morpheme_engine='okt',   # Okt 사용 (빠름)
+                use_ai_spell_check=False  # AI 모델 비활성화 (빠름)
+            )
+
+            result = solution.run_integrated_pipeline(
+                input_folder=str(input_path),
+                output_dir=str(output_path),
+                file_patterns=['*.doc', '*.docx', '*.ppt', '*.pptx'],
+                password=None,
+                top_k_words=500,
+                min_frequency=2,
+                min_priority=0.05,
+                callback=progress_callback
+            )
+
+            # 결과 표시
+            self.error_manager.log(LogLevel.INFO, "=" * 60)
+            if result['success']:
+                self.error_manager.log(LogLevel.INFO, "✅ 통합 맞춤법 검사 완료")
+                self.error_manager.log(LogLevel.INFO, f"추출 파일: {result['extracted_files']}개")
+                self.error_manager.log(LogLevel.INFO, f"전체 단어: {result['total_words']}개")
+                self.error_manager.log(LogLevel.INFO, f"사전 단어: {result['dictionary_words']}개")
+                self.error_manager.log(LogLevel.INFO, f"오타 발견: {result['typos_found']}개")
+                self.error_manager.log(LogLevel.INFO, f"출력 폴더: {output_path}")
+
+                # 종합 리포트 경로
+                report_path = result['output_files'].get('comprehensive_report', '')
+
+                messagebox.showinfo("완료",
+                    f"통합 맞춤법 검사가 완료되었습니다!\n\n"
+                    f"추출 파일: {result['extracted_files']}개\n"
+                    f"전체 단어: {result['total_words']}개\n"
+                    f"사전 단어: {result['dictionary_words']}개 (화이트리스트)\n"
+                    f"오타 발견: {result['typos_found']}개\n"
+                    f"이미지 추출: {result.get('images_extracted', 0)}개\n"
+                    f"OCR 처리: {result.get('ocr_images_processed', 0)}개\n\n"
+                    f"출력 폴더: {output_path}\n\n"
+                    f"📊 종합 리포트:\n{report_path}")
+            else:
+                self.error_manager.log(LogLevel.ERROR, "❌ 통합 맞춤법 검사 실패")
+                error_msg = result.get('error', '알 수 없는 오류')
+                messagebox.showerror("실패", f"맞춤법 검사 중 오류 발생:\n{error_msg}")
+
+        except Exception as e:
+            self.error_manager.log(LogLevel.ERROR, "통합 맞춤법 검사 중 오류 발생", e)
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("오류", f"맞춤법 검사 중 오류:\n{e}")
+
+        finally:
+            self._safe_gui_update(lambda: self.process_button.configure(state="normal"))
+            self._safe_gui_update(lambda: self.progress_var.set(0))
+            self._safe_gui_update(lambda: self.status_label.configure(text="대기 중"))
 
     def _safe_gui_update(self, func):
         """스레드 안전한 GUI 업데이트"""
@@ -1689,112 +1929,21 @@ class AudioManager:
             except ImportError:
                 self.error_manager.log(LogLevel.WARNING, "imageio가 없습니다. pip install imageio-ffmpeg 권장")
 
-            video = None
-            try:
-                video = VideoFileClip(str(video_path))
-
-                if video is None:
-                    self.error_manager.log(LogLevel.ERROR, "비디오 파일을 열 수 없습니다.")
-                    return None
-
-                if not hasattr(video, 'audio') or video.audio is None:
+            with VideoFileClip(str(video_path)) as video:
+                if video.audio is None:
                     self.error_manager.log(LogLevel.WARNING, "비디오에 오디오 트랙이 없습니다.")
-                    if video:
-                        video.close()
                     return None
 
-                # 오디오 객체 가져오기
-                audio = video.audio
-                if audio is None:
-                    self.error_manager.log(LogLevel.WARNING, "오디오 객체를 가져올 수 없습니다.")
-                    video.close()
-                    return None
+                with video.audio as audio:
+                    # 임시 파일 경로 생성 (한글 경로 문제 방지)
+                    temp_audio = self.path_manager.create_temp_file(suffix='.wav')
 
-                # write_audiofile 메서드 확인
-                if not hasattr(audio, 'write_audiofile'):
-                    self.error_manager.log(LogLevel.ERROR, "오디오 객체에 write_audiofile 메서드가 없습니다.")
-                    video.close()
-                    return None
-
-                self.error_manager.log(LogLevel.INFO, f"오디오 파일 작성 중: {audio_path}")
-
-                # 여러 방법으로 시도
-                success = False
-
-                # 방법 1: 기본 write_audiofile (가장 안전)
-                try:
                     audio.write_audiofile(
                         str(audio_path),
                         logger=None,
                         verbose=False,
-                        codec='pcm_s16le',  # WAV용 코덱 명시
-                        fps=44100  # 샘플레이트 명시
+                        temp_audiofile=str(temp_audio) if temp_audio else None
                     )
-                    success = True
-                except Exception as e1:
-                    self.error_manager.log(LogLevel.WARNING, f"방법 1 실패: {e1}")
-
-                    # 방법 2: 임시 파일 없이 시도
-                    try:
-                        # 기존 파일 삭제
-                        if audio_path.exists():
-                            audio_path.unlink()
-
-                        audio.write_audiofile(
-                            str(audio_path),
-                            logger=None,
-                            verbose=False
-                        )
-                        success = True
-                    except Exception as e2:
-                        self.error_manager.log(LogLevel.WARNING, f"방법 2 실패: {e2}")
-
-                        # 방법 3: ffmpeg로 직접 추출
-                        try:
-                            import subprocess
-                            self.error_manager.log(LogLevel.INFO, "ffmpeg로 직접 추출 시도...")
-
-                            # ffmpeg 명령어로 직접 추출
-                            cmd = [
-                                'ffmpeg',
-                                '-i', str(video_path),
-                                '-vn',  # 비디오 스트림 제외
-                                '-acodec', 'pcm_s16le',  # WAV 코덱
-                                '-ar', '44100',  # 샘플레이트
-                                '-ac', '2',  # 스테레오
-                                '-y',  # 덮어쓰기
-                                str(audio_path)
-                            ]
-
-                            result = subprocess.run(
-                                cmd,
-                                capture_output=True,
-                                text=True,
-                                timeout=300
-                            )
-
-                            if result.returncode == 0:
-                                success = True
-                                self.error_manager.log(LogLevel.INFO, "ffmpeg 직접 추출 성공")
-                            else:
-                                self.error_manager.log(LogLevel.ERROR, f"ffmpeg 실패: {result.stderr}")
-                        except Exception as e3:
-                            self.error_manager.log(LogLevel.ERROR, f"방법 3 실패: {e3}")
-
-                video.close()
-
-                if not success:
-                    self.error_manager.log(LogLevel.ERROR, "모든 오디오 추출 방법 실패")
-                    return None
-
-            except Exception as write_error:
-                self.error_manager.log(LogLevel.ERROR, f"오디오 파일 작성 중 에러: {write_error}")
-                if video:
-                    try:
-                        video.close()
-                    except:
-                        pass
-                raise
 
             if audio_path.exists() and audio_path.stat().st_size > 0:
                 self.error_manager.log(LogLevel.INFO, f"MoviePy 오디오 추출 완료: {audio_path}")
@@ -1886,24 +2035,8 @@ class AudioManager:
             self.error_manager.log(LogLevel.ERROR, f"오디오 추출 실패: {video_path}", e)
             return None
 
-    def _get_bundled_model_path(self, model_size: str) -> Optional[Path]:
-        """번들된 Whisper 모델 경로 찾기 (exe용)"""
-        try:
-            # PyInstaller로 번들된 경우
-            if getattr(sys, 'frozen', False):
-                # _MEIPASS는 PyInstaller 임시 디렉토리
-                base_path = Path(sys._MEIPASS)
-                bundled_model = base_path / 'whisper_models' / f'{model_size}.pt'
-                if bundled_model.exists():
-                    self.error_manager.log(LogLevel.INFO, f"번들된 모델 발견: {bundled_model}")
-                    return bundled_model
-            return None
-        except Exception as e:
-            self.error_manager.log(LogLevel.WARNING, f"번들 모델 검색 실패: {e}")
-            return None
-
     def load_whisper_model(self, model_size: str = "base") -> bool:
-        """Whisper 모델 로딩 - 다운로드 진행 상태 표시"""
+        """Whisper 모델 로딩"""
         if not WHISPER_AVAILABLE:
             self.error_manager.log(LogLevel.ERROR, "openai-whisper가 설치되지 않았습니다.")
             return False
@@ -1913,39 +2046,7 @@ class AudioManager:
 
         try:
             self.error_manager.log(LogLevel.INFO, f"Whisper 모델 로딩: {model_size}")
-
-            # 1. 번들된 모델 먼저 확인 (exe 환경)
-            bundled_model = self._get_bundled_model_path(model_size)
-            if bundled_model:
-                self.error_manager.log(LogLevel.INFO, "번들된 모델 사용 중...")
-                # Whisper가 번들 모델을 사용하도록 캐시 디렉토리 설정
-                import os
-                os.environ['WHISPER_CACHE_DIR'] = str(bundled_model.parent)
-                # 번들 모델이 있으면 바로 로딩
-                self.model = whisper.load_model(model_size)
-                self.model_size = model_size
-                self.error_manager.log(LogLevel.INFO, f"Whisper 모델 로딩 성공: {model_size}")
-                return True
-
-            # 2. 모델이 로컬에 있는지 확인 (번들이 없을 경우)
-            from pathlib import Path
-            import os
-            cache_dir = Path(os.path.expanduser("~/.cache/whisper"))
-            model_file = cache_dir / f"{model_size}.pt"
-
-            if not model_file.exists():
-                # 모델을 다운로드해야 함
-                self.error_manager.log(LogLevel.INFO, f"Whisper {model_size} 모델이 없습니다. 다운로드를 시작합니다...")
-                self._download_whisper_model_with_progress(model_size, cache_dir)
-
-            # 3. Whisper 모델 로딩
-            self.error_manager.log(LogLevel.INFO, f"Whisper {model_size} 모델 로딩 중...")
             self.model = whisper.load_model(model_size)
-
-            if self.model is None:
-                self.error_manager.log(LogLevel.ERROR, "Whisper 모델 로딩 실패: 모델이 None입니다.")
-                return False
-
             self.model_size = model_size
             self.error_manager.log(LogLevel.INFO, f"Whisper 모델 로딩 성공: {model_size}")
             return True
@@ -1953,53 +2054,6 @@ class AudioManager:
         except Exception as e:
             self.error_manager.log(LogLevel.ERROR, f"Whisper 모델 로딩 실패: {model_size}", e)
             return False
-
-    def _download_whisper_model_with_progress(self, model_size: str, cache_dir: Path) -> None:
-        """Whisper 모델 다운로드 - 진행 상태 표시"""
-        try:
-            import urllib.request
-            import ssl
-
-            # Whisper 모델 URL
-            _MODELS = {
-                "tiny": "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt",
-                "base": "https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt",
-                "small": "https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt",
-                "medium": "https://openaipublic.azureedge.net/main/whisper/models/345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1/medium.pt",
-                "large": "https://openaipublic.azureedge.net/main/whisper/models/e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb/large-v3.pt",
-            }
-
-            if model_size not in _MODELS:
-                self.error_manager.log(LogLevel.ERROR, f"지원되지 않는 모델 크기: {model_size}")
-                return
-
-            url = _MODELS[model_size]
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            model_path = cache_dir / f"{model_size}.pt"
-
-            # SSL 컨텍스트 생성
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-
-            # 진행 상태 표시를 위한 콜백
-            def reporthook(block_num, block_size, total_size):
-                if total_size > 0:
-                    downloaded = block_num * block_size
-                    percent = min(100, int(downloaded * 100 / total_size))
-                    mb_downloaded = downloaded / (1024 * 1024)
-                    mb_total = total_size / (1024 * 1024)
-
-                    msg = f"다운로드 중: {percent}% ({mb_downloaded:.1f}MB / {mb_total:.1f}MB)"
-                    self.error_manager.log(LogLevel.INFO, msg)
-
-            self.error_manager.log(LogLevel.INFO, f"Whisper {model_size} 모델 다운로드 시작...")
-            urllib.request.urlretrieve(url, model_path, reporthook=reporthook)
-            self.error_manager.log(LogLevel.INFO, f"Whisper {model_size} 모델 다운로드 완료!")
-
-        except Exception as e:
-            self.error_manager.log(LogLevel.ERROR, f"모델 다운로드 실패: {e}")
-            raise
 
     def transcribe_audio(self, audio_path: Union[str, Path]) -> Optional[Dict]:
         """오디오 텍스트 변환 - 한글 지원"""
@@ -2019,15 +2073,8 @@ class AudioManager:
                 return None
 
             if self.model is None:
-                self.error_manager.log(LogLevel.INFO, "Whisper 모델이 로드되지 않았습니다. 로딩을 시작합니다...")
                 if not self.load_whisper_model(self.model_size):
-                    self.error_manager.log(LogLevel.ERROR, "Whisper 모델 로딩 실패")
                     return None
-
-            # 모델이 None인지 다시 확인
-            if self.model is None:
-                self.error_manager.log(LogLevel.ERROR, "Whisper 모델이 여전히 None입니다.")
-                return None
 
             # 한글 경로 문제 해결
             temp_audio = None
@@ -2160,6 +2207,11 @@ class DocumentManager:
     def __init__(self):
         self.path_manager = PathManager()
         self.error_manager = ErrorManager()
+        # SpellChecker 초기화 (사용 가능한 경우)
+        if SPELL_CHECKER_AVAILABLE:
+            self.spell_checker = SpellChecker(use_ai_model=True)
+        else:
+            self.spell_checker = None
 
     def create_word_document(self, transcription: Optional[Dict], frames: List[str],
                              output_path: Union[str, Path], video_name: str) -> bool:
@@ -2702,6 +2754,12 @@ class VideoProcessorMain:
         self.document_manager = DocumentManager()
         self.ppt_manager = PPTManager()
 
+        # OCRManager (사용 가능한 경우)
+        if OCR_AVAILABLE:
+            self.ocr_manager = OCRManager(use_ai_model=True)
+        else:
+            self.ocr_manager = None
+
     def process_video(self, video_path: Union[str, Path],
                       output_base_dir: Union[str, Path] = "output",
                       progress_callback=None) -> ProcessingResult:
@@ -2837,6 +2895,43 @@ class VideoProcessorMain:
                     self.error_manager.log(LogLevel.ERROR, error_msg, e)
                     result.errors.append(error_msg)
 
+            # 6. 프레임 OCR 검수 (선택적 - 설정으로 활성화)
+            if config.ocr_spell_check and config.extract_frames and result.frames and self.ocr_manager and OCR_AVAILABLE:
+                self.error_manager.log(LogLevel.INFO, "🔍 프레임 OCR 검수 중...")
+                try:
+                    # 프레임 폴더에서 OCR 검수 실행
+                    frames_dir = Path(output_dir) / "frames"
+                    if frames_dir.exists():
+                        ocr_output_dir = Path(output_dir) / "frames_ocr_checked"
+                        ocr_output_dir.mkdir(exist_ok=True)
+
+                        def ocr_progress(current, total, path):
+                            if progress_callback:
+                                progress_callback(f"OCR 검수: {current}/{total}")
+
+                        ocr_result = self.ocr_manager.process_folder(
+                            frames_dir,
+                            output_dir=ocr_output_dir,
+                            comparison_mode=True,
+                            file_pattern="*.jpg",
+                            callback=ocr_progress
+                        )
+
+                        if ocr_result['success']:
+                            self.error_manager.log(LogLevel.INFO,
+                                f"✅ OCR 검수 완료: {ocr_result['processed']}개 처리됨")
+                            result.warnings.append(
+                                f"OCR 검수: {ocr_result['processed']}개 프레임 처리, "
+                                f"{ocr_result['failed']}개 실패"
+                            )
+                        else:
+                            result.warnings.append("OCR 검수 실패")
+
+                except Exception as e:
+                    error_msg = f"OCR 검수 중 오류: {e}"
+                    self.error_manager.log(LogLevel.WARNING, error_msg)
+                    result.warnings.append(error_msg)
+
             # 처리 완료
             result.processing_time = time.time() - start_time
 
@@ -2889,8 +2984,8 @@ def main_cli():
                         help='샘플링 간격 (초, 기본: 1.0)')
     parser.add_argument('--min-interval', type=float, default=0.5,
                         help='최소 프레임 간격 (초, 기본: 0.5)')
-    parser.add_argument('--max-frames', type=int, default=99999,
-                        help='비디오당 최대 프레임 수 (기본: 99999, 사실상 무제한)')
+    parser.add_argument('--max-frames', type=int, default=200,
+                        help='비디오당 최대 프레임 수 (기본: 200)')
     parser.add_argument('--no-frames', action='store_true', help='프레임 추출 안 함')
     parser.add_argument('--no-ppt', action='store_true', help='PPT 생성 안 함')
     parser.add_argument('--no-audio', action='store_true', help='음성 추출 안 함')
